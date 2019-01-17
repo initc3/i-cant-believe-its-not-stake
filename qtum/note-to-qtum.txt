@@ -1,0 +1,209 @@
+Dear Qtum developers,
+
+Qtum and several other cryptocurrencies based on chain-style proof of
+stake, are vulnerable to a resource exhaustion attack: An attacker
+that connects to a victim node as a peer can send invalid blocks
+and/or headers, which are stored in RAM or on disk without being
+validated. The consequence is that an attacker can connect to a victim
+node and fill its disk or RAM, until the node crashes or slows. The
+attack is easy to carry out, since it does not actually require the
+attacker to make valid stake transactions. It can be made faster by
+making multiple socket connections to the victim. In our benchmarks
+like, targeting our own node running on the qtum testnet, we were able
+to fill RAM at the rate of 2MB per second, and disk at a rate of 6MB
+per second.
+
+To aid in reproducibility, we’ve made a demonstration in the form of a
+test script for the regtest / python test framework. We also discuss a
+range of possible mitigation approaches, with varying levels of
+development effort. Although it is possible at least to make the
+attack require *some* stake to carry out, it seems difficult to stamp
+out entirely.
+
+This vulnerability affects several cryptocurrencies, so we are making
+a coordinated disclosure effort to responsible developers for the
+affected cryptocurrencies before publishing it.  Description of the
+vulnerability Qtum inherits many of its design elements from the
+Bitcoin codebase, which made sense given Proof-of-Work chain but do
+not provide adequate security in a Proof-of-Stake chain. In general,
+Bitcoin checks proof-of-work headers before guarding Disk and RAM
+resources, while in Qtum resources are claimed even without the
+analogous proof-of-stake checks.
+
+In more detail, when a node receives proof of stake block not on the
+main chain, it does not fully check their proof-of-stake.  Instead it
+keeps track of a “best chain” which is fully validated, but also a
+tree of blocks which have may not be valid. The transactions and stake
+transaction are only checked when there is a reorg or a network
+partition. As a result, in PoSv3 coins it is possible to get nodes to
+store data on disk and in RAM, even without having any stake.
+
+The three relevant data structures are: - mapBlockIndex: an in-memory
+data structure In Bitcoin, it requires expenditure of work to get
+values placed in here. In qtum PoSv3, it is possible to add malformed
+blocks that pass here without having any stake - /blocks/ disk files:
+an on disk, append-only, copy of all the blocks in the blockchain All
+blocks on disk are reflected in mapBlockIndex, but not necessarily
+vice versa. It does not require any additional checks to pass, hence
+blocks are stored in the /block/disk files.  - pcoinsTip: a database
+of the unspent transaction outputs, in the current active chain. It is
+backed by an on-disk (leveldb) storage of all the unspent transaction
+outputs, in the view of the current main chain. When performing a
+reorg, it is necessary to modify pcoinsTip. Undo files provide a list
+of transaction outputs to put back into the database.
+
+The four relevant methods are: - AcceptBlockHeader(): In Bitcoin this
+checks the proof of work. It must build on a block that is also valid
+(unconnected headers are also stored temporarily). The method finally
+stores an entry in mapBlockIndex (RAM). In qtum, this method directly
+stores an entry into mapBockIndex(RAM)
+
+- AcceptBlock() This does not check the validity of transactions. This
+  stores the block on disk in /blocks/disk files.
+
+- ConnectBlock(): Adds a block to the end of the main chain. This
+   performs the actual check of the validity of transactions. This
+   method does reorg and relays blocks to peers.
+
+- ConnectTip(): Begins a “reorg” from the current active chain, to a
+   new active chain. For longer reorgs this results in high CPU
+   usage. This performs validation of the blocks and rollback of
+   pcoinsTip . This blocks the node from processing new blocks as the
+   main thread is blocked in processing the reorg.
+
+Exploiting the vulnerability: It is possible to send malformed chains
+of headers that pass for valid, even though they don’t have any
+stake. To allocate memory at the host, the attacker sends a payload
+containing a valid header, that purports to have a valid PoS
+transaction, but for which there doesn’t correspond any valid money or
+valid coinstake transaction. The header regardless passes the
+AcceptBlockHeader method and allocates new memory at the node. To
+target disk rather than RAM, the attack can send a invalid Block that
+passes AcceptBlock, storing the block on disk, but still bypassing any
+checks that the coinstake transaction spends a valid UTXO. Since
+checking that a proof of stake transaction is valid only occurs later,
+in the ConnectTip method, which builds on chainActive.Tip(), the
+current best known chain.  Demonstrating and validating the attack We
+implemented both forms of the attack, one that targets Disk exhaustion
+and another that targets RAM. We validate the attack in two ways: a
+docker container using the functional / regtest framework, and an
+attack on our own node on testnet.
+
+Docker reprodubility kit The docker file and test script are
+attached. The DockerFile clones the code from qtum repository and only
+added 1 line at line 104 misc.cpp to print mapBlockIndex.size() in the
+getinfo() rpc call. Please note that the apart from this one line
+addition of the code of qtum is exactly the same as found on
+qtumproject/qtum.
+
+There is nothingatstake.py which contains the code for 2 attacks(disk,
+headers) using bitcoin Test Framework. The first one is the headers
+attack and the second one is the disk attack.  The headers attack
+shows the initial and final mapBlockIndex.size() . The disk attack
+prints the initial and final size of the blocks directory. Note that
+the attack only runs for a short period of time for the purposes of
+demo, whereas in reality we can keep on on doing it until the victim
+runs out of disk or memory.
+
+Instructions of using docker to reproduce the attack: Put the
+Dockerfile and qtum-nothingatstake.py into the same directory Build
+docker image by the following command: docker image build -t
+[image_name] .  After building the docker image, you can now launch a
+container and reproduce the attack: docker container run -it
+[image_name]
+
+       Here is a link to a sample of the output you should expect to
+       see:
+       https://gist.github.com/amiller/b012b2bda2da4ee630624730c8f86de3
+
+Benchmarking the attack against our own node on test network
+
+Our setup for the testnet test goes as follows. In the RAM attack, we
+just grab 2000 headers and change the Merkle root hash field in order
+to produce headers with a different hash and keep on sending it out
+until the target runs out of memory. We were able to achieve a speed
+of 2.05 MB/s using a single node connection, which means that most
+nodes could be taken down in less than an hour. Please note that the
+2.05 MB/s is certainly not the upper limit and faster speeds can be
+achieved by precomputing headers.
+
+For the disk attack, what we did was we disabled the public key
+signature check, in order to simulate that we owned the block and thus
+pass all the cases in CheckBlock(). This was also done to ensure that
+if the blocks were ever to sent to other nodes outside of our setup,
+that the duplicate blocks wouldn’t be stored by nodes outside of our
+network.
+
+Our set up went as the following. For the disk attack, we first set up
+10 Python mininodes and continuously ran the attack for at least 10
+minutes. We obtained the following benchmarks. Note that our attack
+node had a 50 Mbps internet connection, which became the bottleneck
+for the disk attack.  6.24 MB/s for the disk attack 2.05 MB/s for the
+RAM attack.  Mitigations We discuss a range of possible mitigations
+and their tradeoffs:
+
+1. To mitigate disk attack, ask for blocks on long forks only when
+greater.  Maximizing our disk attack took advantage of the fact that
+nodes request blocks when the apparent chainwork of a fork is *equal
+or greater* than the current tip, but only reorg / validate a fork
+when the apparent chain work is *strictly greater* than the
+chainActive.tip().
+
+2. Check the existence of the prevoutStake transaction before
+accepting a header. The main advantage of this is that it makes some
+stake required.  This is similar to what PeerCoin and other
+cryptocurrencies do. Because they have no headers message, only block
+message, the stake transaction is always available. The coins database
+is not available for a fork in history, but Peercoin and others
+perform a heuristic check where they check the stakePrevout in the
+current txdb associated with the main chain. This does not catch
+duplicate stakePrevouts, or stakePrevouts that are present on the main
+chain but *not* on the reorg, but requires at least some stake to pull
+off the attack.
+
+3. Accept some risk of chainsplit by not processing reorgs beyond a
+   fixed length.  This could be relaxed if the node is not under
+   attack, by counting the number of non-mainchain headers received.
+
+4. Heuristically detect attacking peers and disconnect them, even if
+message sent are not otherwise invalid.
+
+In order to maximize throughput, what we did was just grabbed 2000
+headers and modified the hashMerkleRoot field and the hashPrevBlock
+fields and we continuously sent headers starting from the same
+point. One way to reduce throughput is to watch for peers that lots of
+headers message that all originate from the same height.
+
+For the block attack, one thing that we did was that we sent 8MB
+blocks and it so it would be suspicious if a node sent many forks
+containing just large blocks. One issue that we found to be annoying
+when we were running the test on testnet is that the block that we
+went had to be of equal or greater chainwork and to get the block to
+actually store it, we would have to send headers that included that
+block beforehand.
+
+5. Mitigate RAM attack by providing a way to remove headers from
+mapBlockIndex, and/or from the blocks database.  One approach is with
+a Time-To-Live if we have not received the block.
+
+Another approach is to keep track of which peers are vouching for
+which headers (reference counting), freeing them if no active peer
+still appears to have them on its best known chain.
+
+The challenge with removing blocks from the block files is that they
+are appended only, so this would require some kind of background
+compaction process.
+
+6. Enable full validation of blocks even outside of doing a reorg.
+This is costly as it would require making a copy of the coins
+database, potentially one for each peer. This can be made more
+efficient through techniques such as UTXO commitments or UTXO
+snapshots. With UTXO snapshots we’d take rolling snapshots of the
+chainstate database at some prior block. With UTXO commitments, the
+merkle tree proofs associated with new transactions would be
+transmitted alongside each block/header.
+
+--
+Andrew, Joseph, Sanket, Yunqi
+Decentralized Systems Lab
+University of Illinois at Urbana-Champaign
